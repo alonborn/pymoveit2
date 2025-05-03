@@ -755,14 +755,15 @@ class MoveIt2:
         Wait until the previously requested motion is finalised through either a success or failure.
         """
 
-        if not self.__is_motion_requested:
-            self._node.get_logger().warn(
-                "Cannot wait until motion is executed (no motion is in progress)."
-            )
-            return False
+        # if not self.__is_motion_requested:
+        #     self._node.get_logger().warn(
+        #         "Cannot wait until motion is executed (no motion is in progress)."
+        #     )
+        #     return False
 
         while self.__is_motion_requested or self.__is_executing:
             rclpy.spin_once(self._node, executor=self._node.executor,timeout_sec=1.0)
+            
             
 
         return self.motion_suceeded
