@@ -8,6 +8,9 @@ import rclpy
 from action_msgs.msg import GoalStatus
 from geometry_msgs.msg import Point, Pose, PoseStamped, Quaternion
 from moveit_msgs.action import ExecuteTrajectory, MoveGroup
+import traceback
+import time
+
 from moveit_msgs.msg import (
     AllowedCollisionEntry,
     AttachedCollisionObject,
@@ -275,7 +278,7 @@ class MoveIt2:
             ),
             callback_group=self._callback_group,
         )
-
+        self._node.get_logger().info("Action _execute_trajectory_action_client was initialized.")
         # Create a service for getting the planning scene
         self._get_planning_scene_service = self._node.create_client(
             srv_type=GetPlanningScene,
@@ -288,6 +291,7 @@ class MoveIt2:
             ),
             callback_group=callback_group,
         )
+        self._node.get_logger().info("Action _get_planning_scene_service was initialized.")
         self.__planning_scene = None
         self.__old_planning_scene = None
         self.__old_allowed_collision_matrix = None
@@ -304,6 +308,23 @@ class MoveIt2:
             ),
             callback_group=callback_group,
         )
+
+
+    def wait_for_servers(self, timeout_sec=5.0) -> bool:
+        self._node.get_logger().info("Waiting for action servers...")
+
+        move_ready = self.__move_action_client.wait_for_server(timeout_sec=timeout_sec)
+        if not move_ready:
+            self._node.get_logger().error("MoveGroup action server not available.")
+            return False
+
+        exec_ready = self._execute_trajectory_action_client.wait_for_server(timeout_sec=timeout_sec)
+        if not exec_ready:
+            self._node.get_logger().error("ExecuteTrajectory action server not available.")
+            return False
+
+        self._node.get_logger().info("Both action servers are ready.")
+        return True
 
     #### Execution Polling Functions
     def query_state(self) -> MoveIt2State:
@@ -519,10 +540,19 @@ class MoveIt2:
         """
         Call plan_async and wait on future
         """
+        # future = self.plan_async(
+        #     **{
+        #         key: value
+        #         for key, value in locals().items()
+        #         if key not in ["self", "cartesian_fraction_threshold"]
+        #     }
+        # )
+
+        local_copy = dict(locals())  # make a stable copy
         future = self.plan_async(
             **{
                 key: value
-                for key, value in locals().items()
+                for key, value in local_copy.items()
                 if key not in ["self", "cartesian_fraction_threshold"]
             }
         )
@@ -531,8 +561,10 @@ class MoveIt2:
             return None
         
         # 100ms sleep
-        rate = self._node.create_rate(10)
+        rate = self._node.create_rate(100)
+        print (self._node.executor._nodes)
         while not future.done():
+            rate = self._node.create_rate(100)
             rclpy.spin_once(self._node,executor=self._node.executor, timeout_sec=1.0)
 
         return self.get_trajectory(
@@ -2070,7 +2102,9 @@ class MoveIt2:
                 f"Service '{self._plan_cartesian_path_service.srv_name}' is not yet available. Better luck next time!"
             )
             return None
-
+        self._node.get_logger().info(
+            f"Service '{self._plan_cartesian_path_service.srv_name}' is ready."
+        )
         return self._plan_cartesian_path_service.call_async(
             self.__cartesian_path_request
         )
@@ -2087,6 +2121,7 @@ class MoveIt2:
 
         self.__last_error_code = None
         self.__is_motion_requested = True
+        self._node.get_logger().info("Sending goal to action server")
         self.__send_goal_future_move_action = self.__move_action_client.send_goal_async(
             goal=self.__move_action_goal,
             feedback_callback=None,
@@ -2100,23 +2135,30 @@ class MoveIt2:
 
     def __response_callback_move_action(self, response):
         self.__execution_mutex.acquire()
-        goal_handle = response.result()
-        if not goal_handle.accepted:
-            self._node.get_logger().warn(
-                f"Action '{self.__move_action_client._action_name}' was rejected."
-            )
+        try:
+            goal_handle = response.result()
+            if not goal_handle.accepted:
+                self._node.get_logger().warn(
+                    f"Action '{self.__move_action_client._action_name}' was rejected."
+                )
+                self.__is_motion_requested = False
+                return
+
+            self.__execution_goal_handle = goal_handle
+            self.__is_executing = True
             self.__is_motion_requested = False
-            return
 
-        self.__execution_goal_handle = goal_handle
-        self.__is_executing = True
-        self.__is_motion_requested = False
-
-        self.__get_result_future_move_action = goal_handle.get_result_async()
-        self.__get_result_future_move_action.add_done_callback(
-            self.__result_callback_move_action
-        )
-        self.__execution_mutex.release()
+            self.__get_result_future_move_action = goal_handle.get_result_async()
+            self.__get_result_future_move_action.add_done_callback(
+                self.__result_callback_move_action
+            )
+        except Exception as e:
+            self._node.get_logger().error(
+                f"Exception in __response_callback_move_action: {e}"
+            )
+            traceback.print_exc()
+        finally:
+            self.__execution_mutex.release()
 
     def __result_callback_move_action(self, res):
         self.__execution_mutex.acquire()
