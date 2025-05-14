@@ -2,15 +2,12 @@ import copy
 import threading
 from enum import Enum
 from typing import Any, List, Optional, Tuple, Union
-
+from typing import Callable, Optional
 import numpy as np
 import rclpy
 from action_msgs.msg import GoalStatus
 from geometry_msgs.msg import Point, Pose, PoseStamped, Quaternion
 from moveit_msgs.action import ExecuteTrajectory, MoveGroup
-import traceback
-import time
-
 from moveit_msgs.msg import (
     AllowedCollisionEntry,
     AttachedCollisionObject,
@@ -103,7 +100,7 @@ class MoveIt2:
 
         self._node = node
         self._callback_group = callback_group
-
+        #self.__execution_done_event = threading.Event()
         # Check for deprecated parameters
         if execute_via_moveit:
             self._node.get_logger().warn(
@@ -155,11 +152,7 @@ class MoveIt2:
         self.motion_suceeded = False
         self.__execution_goal_handle = None
         self.__last_error_code = None
-        self.__wait_until_executed_rate = self._node.create_rate(1000.0)
         self.__execution_mutex = threading.Lock()
-
-        # Event that enables waiting until async future is done
-        self.__future_done_event = threading.Event()
 
         # Create subscriber for current joint states
         self._node.create_subscription(
@@ -278,7 +271,7 @@ class MoveIt2:
             ),
             callback_group=self._callback_group,
         )
-        self._node.get_logger().info("Action _execute_trajectory_action_client was initialized.")
+
         # Create a service for getting the planning scene
         self._get_planning_scene_service = self._node.create_client(
             srv_type=GetPlanningScene,
@@ -291,7 +284,6 @@ class MoveIt2:
             ),
             callback_group=callback_group,
         )
-        self._node.get_logger().info("Action _get_planning_scene_service was initialized.")
         self.__planning_scene = None
         self.__old_planning_scene = None
         self.__old_allowed_collision_matrix = None
@@ -308,23 +300,6 @@ class MoveIt2:
             ),
             callback_group=callback_group,
         )
-
-
-    def wait_for_servers(self, timeout_sec=5.0) -> bool:
-        self._node.get_logger().info("Waiting for action servers...")
-
-        move_ready = self.__move_action_client.wait_for_server(timeout_sec=timeout_sec)
-        if not move_ready:
-            self._node.get_logger().error("MoveGroup action server not available.")
-            return False
-
-        exec_ready = self._execute_trajectory_action_client.wait_for_server(timeout_sec=timeout_sec)
-        if not exec_ready:
-            self._node.get_logger().error("ExecuteTrajectory action server not available.")
-            return False
-
-        self._node.get_logger().info("Both action servers are ready.")
-        return True
 
     #### Execution Polling Functions
     def query_state(self) -> MoveIt2State:
@@ -446,24 +421,44 @@ class MoveIt2:
 
         else:
             # Plan via MoveIt 2 and then execute directly with the controller
-            self.execute(
-                self.plan(
-                    position=pose_stamped.pose.position,
-                    quat_xyzw=pose_stamped.pose.orientation,
-                    frame_id=pose_stamped.header.frame_id,
-                    target_link=target_link,
-                    tolerance_position=tolerance_position,
-                    tolerance_orientation=tolerance_orientation,
-                    weight_position=weight_position,
-                    weight_orientation=weight_orientation,
-                    cartesian=cartesian,
-                    max_step=cartesian_max_step,
-                    cartesian_fraction_threshold=cartesian_fraction_threshold,
-                )
+            # self.execute(
+            #     self.plan(
+            #         position=pose_stamped.pose.position,
+            #         quat_xyzw=pose_stamped.pose.orientation,
+            #         frame_id=pose_stamped.header.frame_id,
+            #         target_link=target_link,
+            #         tolerance_position=tolerance_position,
+            #         tolerance_orientation=tolerance_orientation,
+            #         weight_position=weight_position,
+            #         weight_orientation=weight_orientation,
+            #         cartesian=cartesian,
+            #         max_step=cartesian_max_step,
+            #         cartesian_fraction_threshold=cartesian_fraction_threshold,
+            #     )
+            # )
+            
+            def _after_plan_cb(traj):
+                if traj is not None:
+                    self.execute(traj)
+                else:
+                    self._node.get_logger().warn("Planning failed, no trajectory to execute.")
+                    #self.__execution_done_event.set()
+
+            self.plan(
+                position=pose_stamped.pose.position,
+                quat_xyzw=pose_stamped.pose.orientation,
+                frame_id=pose_stamped.header.frame_id,
+                target_link=target_link,
+                tolerance_position=tolerance_position,
+                tolerance_orientation=tolerance_orientation,
+                weight_position=weight_position,
+                weight_orientation=weight_orientation,
+                cartesian=cartesian,
+                max_step=cartesian_max_step,
+                cartesian_fraction_threshold=cartesian_fraction_threshold,
+                callback=_after_plan_cb,
             )
-            self._node.get_logger().info(
-                f"Executed trajectory with points."
-            )
+        
 
     def move_to_configuration(
         self,
@@ -536,48 +531,46 @@ class MoveIt2:
         cartesian: bool = False,
         max_step: float = 0.0025,
         cartesian_fraction_threshold: float = 0.0,
+        callback: Optional[Callable[[Optional[JointTrajectory]], None]] = None,
     ) -> Optional[JointTrajectory]:
         """
         Call plan_async and wait on future
         """
-        # future = self.plan_async(
-        #     **{
-        #         key: value
-        #         for key, value in locals().items()
-        #         if key not in ["self", "cartesian_fraction_threshold"]
-        #     }
-        # )
-
-        local_copy = dict(locals())  # make a stable copy
         future = self.plan_async(
             **{
                 key: value
-                for key, value in local_copy.items()
-                if key not in ["self", "cartesian_fraction_threshold"]
+                for key, value in locals().items()
+                if key not in ["self", "cartesian_fraction_threshold", "callback"]
             }
         )
 
         if future is None:
-            return None
+            if callback:
+                callback(None)
+            self.motion_suceeded = False
+            return
+
+        def _plan_done_cb(fut):
+            traj = self.get_trajectory(
+                fut,
+                cartesian=cartesian,
+                cartesian_fraction_threshold=cartesian_fraction_threshold,
+            )
+            if callback:
+                callback(traj)
         
-        # 100ms sleep
-        rate = self._node.create_rate(100)
-        print (self._node.executor._nodes)
-        while not future.done():
-            rate = self._node.create_rate(100)
-            #rclpy.spin_once(self._node,executor=self._node.executor, timeout_sec=1.0)
-            temp_executror = self._node.executor
-            temp_executror.remove_node(self._node)
-            rclpy.spin_once(self._node, timeout_sec=1.0)
-            temp_executror.add_node(self._node)
-            self._node.executor = temp_executror
+        future.add_done_callback(_plan_done_cb)
 
+        # self._node.get_logger().info("---> Waiting for trajectory to be planned...")
+        # print("---> Waiting for trajectory to be planned...")
+        # while not future.done():
+        #     rclpy.spin_once(self._node, timeout_sec=1.0)
 
-        return self.get_trajectory(
-            future,
-            cartesian=cartesian,
-            cartesian_fraction_threshold=cartesian_fraction_threshold,
-        )
+        # return self.get_trajectory(
+        #     future,
+        #     cartesian=cartesian,
+        #     cartesian_fraction_threshold=cartesian_fraction_threshold,
+        # )
 
     def plan_async(
         self,
@@ -683,13 +676,9 @@ class MoveIt2:
                 start_joint_state = self.__joint_state
                 break
             else:
-                #rclpy.spin_once(self._node,executor=self._node.executor, timeout_sec=1.0)
-                temp_executror = self._node.executor
-                temp_executror.remove_node(self._node)
+                self._node._logger.warn(message="---> Waiting for joint states...")  
+                print ("---> Waiting for joint states...")
                 rclpy.spin_once(self._node, timeout_sec=1.0)
-                temp_executror.add_node(self._node)
-                self._node.executor = temp_executror
-
         self._node._logger.info(message="Joint states are available now")
 
         # Plan trajectory asynchronously by service call
@@ -743,6 +732,7 @@ class MoveIt2:
                         f"Planning failed! Cartesian planner completed {res.fraction} "
                         f"of the trajectory, less than the threshold {cartesian_fraction_threshold}."
                     )
+                    self.motion_suceeded = False
                     return None
             else:
                 self._node.get_logger().warn(
@@ -758,16 +748,13 @@ class MoveIt2:
             self._node.get_logger().warn(
                 f"Planning failed! Error code: {enum_to_str(MoveItErrorCodes, res.error_code.val)}"
             )
+            self.motion_suceeded = False
             return None
 
     def execute(self, joint_trajectory: JointTrajectory):
         """
         Execute joint_trajectory by communicating directly with the controller.
         """
-        if joint_trajectory is not None and len(joint_trajectory.points) > 0 :
-            self._node.get_logger().info(
-                f"Executing trajectory with {len(joint_trajectory.points)} points."
-            )
 
         if self.__ignore_new_calls_while_executing and (
             self.__is_motion_requested or self.__is_executing
@@ -775,6 +762,7 @@ class MoveIt2:
             self._node.get_logger().warn(
                 "Controller is already following a trajectory. Skipping motion."
             )
+            self.motion_suceeded = True
             return
 
         execute_trajectory_goal = init_execute_trajectory_goal(
@@ -785,13 +773,10 @@ class MoveIt2:
             self._node.get_logger().warn(
                 "Cannot execute motion because the provided/planned trajectory is invalid."
             )
+            self.motion_suceeded = False
             return
 
         self._send_goal_async_execute_trajectory(goal=execute_trajectory_goal)
-
-        self._node.get_logger().info(
-            f"Trajectory sent for execution"
-        )
 
     def wait_until_executed(self) -> bool:
         """
@@ -804,21 +789,20 @@ class MoveIt2:
         #     )
         #     return False
 
-        while self.__is_motion_requested or self.__is_executing:
-            #rclpy.spin_once(self._node, executor=self._node.executor,timeout_sec=1.0)
-            temp_executror = self._node.executor
-            temp_executror.remove_node(self._node)
-            rclpy.spin_once(self._node, timeout_sec=1.0)
-            temp_executror.add_node(self._node)
-            self._node.executor = temp_executror
+        # self._node.get_logger().info("---> Waiting until motion is executed...")
+        # print("---> Waiting until motion is executed...")
+        # while self.__is_motion_requested or self.__is_executing:
+        #     rclpy.spin_once(self._node, timeout_sec=1.0)
 
-            
-            
-
+        print ("wait_until_executed (.wait() is called)")
+        print(f"[{threading.current_thread().name}] wait_until_executed (.wait() is called)")
+        #self.__execution_done_event.wait()
+        print(f"[{threading.current_thread().name}] wait_until_executed unblocked")
         return self.motion_suceeded
 
     def reset_controller(
-        self, joint_state: Union[JointState, List[float]], sync: bool = True
+        self,
+        joint_state: Union[JointState, List[float]],
     ):
         """
         Reset controller to a given `joint_state` by sending a dummy joint trajectory.
@@ -835,10 +819,7 @@ class MoveIt2:
             joint_trajectory=joint_trajectory
         )
 
-        self._send_goal_async_execute_trajectory(
-            goal=execute_trajectory_goal,
-            wait_until_response=sync,
-        )
+        self._send_goal_async_execute_trajectory(goal=execute_trajectory_goal)
 
     def set_pose_goal(
         self,
@@ -1255,16 +1236,10 @@ class MoveIt2:
 
         if future is None:
             return None
-
-        # 100ms sleep
-        rate = self._node.create_rate(10)
+        self._node.get_logger().info("---> Waiting for FK result...")
+        print("---> Waiting for FK result...")
         while not future.done():
-            #rclpy.spin_once(self._node,executor=self._node.executor, timeout_sec=1.0)
-            temp_executror = self._node.executor
-            temp_executror.remove_node(self._node)
             rclpy.spin_once(self._node, timeout_sec=1.0)
-            temp_executror.add_node(self._node)
-            self._node.executor = temp_executror
 
         return self.get_compute_fk_result(future, fk_link_names=fk_link_names)
 
@@ -1355,15 +1330,10 @@ class MoveIt2:
         if future is None:
             return None
 
-        # 10ms sleep
-        rate = self._node.create_rate(10)
+        self._node.get_logger().info("---> Waiting for IK result...")
+        print("---> Waiting for IK result...")  
         while not future.done():
-            #rclpy.spin_once(self._node,executor=self._node.executor, timeout_sec=1.0)
-            temp_executror = self._node.executor
-            temp_executror.remove_node(self._node)
             rclpy.spin_once(self._node, timeout_sec=1.0)
-            temp_executror.add_node(self._node)
-            self._node.executor = temp_executror
 
         return self.get_compute_ik_result(future)
 
@@ -2129,9 +2099,7 @@ class MoveIt2:
                 f"Service '{self._plan_cartesian_path_service.srv_name}' is not yet available. Better luck next time!"
             )
             return None
-        self._node.get_logger().info(
-            f"Service '{self._plan_cartesian_path_service.srv_name}' is ready."
-        )
+
         return self._plan_cartesian_path_service.call_async(
             self.__cartesian_path_request
         )
@@ -2148,7 +2116,6 @@ class MoveIt2:
 
         self.__last_error_code = None
         self.__is_motion_requested = True
-        self._node.get_logger().info("Sending goal to action server")
         self.__send_goal_future_move_action = self.__move_action_client.send_goal_async(
             goal=self.__move_action_goal,
             feedback_callback=None,
@@ -2162,30 +2129,23 @@ class MoveIt2:
 
     def __response_callback_move_action(self, response):
         self.__execution_mutex.acquire()
-        try:
-            goal_handle = response.result()
-            if not goal_handle.accepted:
-                self._node.get_logger().warn(
-                    f"Action '{self.__move_action_client._action_name}' was rejected."
-                )
-                self.__is_motion_requested = False
-                return
-
-            self.__execution_goal_handle = goal_handle
-            self.__is_executing = True
+        goal_handle = response.result()
+        if not goal_handle.accepted:
+            self._node.get_logger().warn(
+                f"Action '{self.__move_action_client._action_name}' was rejected."
+            )
             self.__is_motion_requested = False
+            return
 
-            self.__get_result_future_move_action = goal_handle.get_result_async()
-            self.__get_result_future_move_action.add_done_callback(
-                self.__result_callback_move_action
-            )
-        except Exception as e:
-            self._node.get_logger().error(
-                f"Exception in __response_callback_move_action: {e}"
-            )
-            traceback.print_exc()
-        finally:
-            self.__execution_mutex.release()
+        self.__execution_goal_handle = goal_handle
+        self.__is_executing = True
+        self.__is_motion_requested = False
+
+        self.__get_result_future_move_action = goal_handle.get_result_async()
+        self.__get_result_future_move_action.add_done_callback(
+            self.__result_callback_move_action
+        )
+        self.__execution_mutex.release()
 
     def __result_callback_move_action(self, res):
         self.__execution_mutex.acquire()
@@ -2201,29 +2161,25 @@ class MoveIt2:
 
         self.__execution_goal_handle = None
         self.__is_executing = False
+        print ("execution done is set 2")
+        #self.__execution_done_event.set()
         self.__execution_mutex.release()
 
-    def _send_goal_async_execute_trajectory(
-        self,
-        goal: ExecuteTrajectory,
-        wait_until_response: bool = False,
-    ):
+    def _send_goal_async_execute_trajectory(self,goal: ExecuteTrajectory,):
         self.__execution_mutex.acquire()
-        self._node.get_logger().info(
-            f"Sending goal to action server '{self._execute_trajectory_action_client._action_name}'"
-        )
+
         if not self._execute_trajectory_action_client.server_is_ready():
             self._node.get_logger().warn(
                 f"Action server '{self._execute_trajectory_action_client._action_name}' is not yet available. Better luck next time!"
             )
+            self.__execution_mutex.release()
             return
-
-        self._node.get_logger().info(
-            f"Action server '{self._execute_trajectory_action_client._action_name}' is ready."
-        )
 
         self.__last_error_code = None
         self.__is_motion_requested = True
+        print ("execution done is cleared 1 ")
+        #self.__execution_done_event.clear()  # Clear the event before sending
+
         self.__send_goal_future_execute_trajectory = (
             self._execute_trajectory_action_client.send_goal_async(
                 goal=goal,
@@ -2231,21 +2187,21 @@ class MoveIt2:
             )
         )
 
+        def wrapped_response_callback(future):
+            self.__response_callback_execute_trajectory(future)
+            #print ("execution done is set 1")
+            #print(f"[{threading.current_thread().name}] wrapped_response_callback: setting event")
+            #self.__execution_done_event.set()  # Signal completion
+
         self.__send_goal_future_execute_trajectory.add_done_callback(
-            self.__response_callback_execute_trajectory
-        )
-        self._node.get_logger().info(
-            f"Goal1 sent to action server '{self._execute_trajectory_action_client._action_name}'"
-        )
-        self.__execution_mutex.release()
-        self._node.get_logger().info(
-            f"self.__execution_mutex.release()"
+            wrapped_response_callback
         )
 
+        self.__execution_mutex.release()
+    def is_executing(self):
+        return self.__is_executing
     def __response_callback_execute_trajectory(self, response):
-        self._node.get_logger().info(
-            f"Response received from action server '{self._execute_trajectory_action_client._action_name}'"
-        )
+        print ("__response_callback_execute_trajectory was called")
         self.__execution_mutex.acquire()
         goal_handle = response.result()
         if not goal_handle.accepted:
@@ -2260,16 +2216,16 @@ class MoveIt2:
         self.__is_motion_requested = False
 
         self.__get_result_future_execute_trajectory = goal_handle.get_result_async()
+        print ("adding callback:__result_callback_execute_trajectory")
         self.__get_result_future_execute_trajectory.add_done_callback(
             self.__result_callback_execute_trajectory
         )
         self.__execution_mutex.release()
 
-    def __response_callback_with_event_set_execute_trajectory(self, response):
-        self.__future_done_event.set()
-
     def __result_callback_execute_trajectory(self, res):
         self.__execution_mutex.acquire()
+
+        print ("__result_callback_execute_trajectory was called2")
         if res.result().status != GoalStatus.STATUS_SUCCEEDED:
             self._node.get_logger().warn(
                 f"Action '{self._execute_trajectory_action_client._action_name}' was unsuccessful: {enum_to_str(GoalStatus, res.result().status)}."
@@ -2277,11 +2233,13 @@ class MoveIt2:
             self.motion_suceeded = False
         else:
             self.motion_suceeded = True
-
+        print ("__result_callback_execute_trajectory was called2")
         self.__last_error_code = res.result().result.error_code
 
         self.__execution_goal_handle = None
         self.__is_executing = False
+        print ("execution done is set 3")
+        #self.__execution_done_event.set()  # Signal completion
         self.__execution_mutex.release()
 
     @classmethod
