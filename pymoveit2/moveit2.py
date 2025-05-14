@@ -567,8 +567,11 @@ class MoveIt2:
             rate = self._node.create_rate(100)
             #rclpy.spin_once(self._node,executor=self._node.executor, timeout_sec=1.0)
             temp_executror = self._node.executor
+            temp_executror.remove_node(self._node)
             rclpy.spin_once(self._node, timeout_sec=1.0)
+            temp_executror.add_node(self._node)
             self._node.executor = temp_executror
+
 
         return self.get_trajectory(
             future,
@@ -680,9 +683,11 @@ class MoveIt2:
                 start_joint_state = self.__joint_state
                 break
             else:
+                #rclpy.spin_once(self._node,executor=self._node.executor, timeout_sec=1.0)
                 temp_executror = self._node.executor
-                #rclpy.spin_once(self._node, executor=self._node.executor, timeout_sec=1.0)
+                temp_executror.remove_node(self._node)
                 rclpy.spin_once(self._node, timeout_sec=1.0)
+                temp_executror.add_node(self._node)
                 self._node.executor = temp_executror
 
         self._node._logger.info(message="Joint states are available now")
@@ -800,9 +805,11 @@ class MoveIt2:
         #     return False
 
         while self.__is_motion_requested or self.__is_executing:
-            temp_executror = self._node.executor
             #rclpy.spin_once(self._node, executor=self._node.executor,timeout_sec=1.0)
-            rclpy.spin_once(self._node,timeout_sec=1.0)
+            temp_executror = self._node.executor
+            temp_executror.remove_node(self._node)
+            rclpy.spin_once(self._node, timeout_sec=1.0)
+            temp_executror.add_node(self._node)
             self._node.executor = temp_executror
 
             
@@ -1252,9 +1259,11 @@ class MoveIt2:
         # 100ms sleep
         rate = self._node.create_rate(10)
         while not future.done():
-            temp_executror = self._node.executor
             #rclpy.spin_once(self._node,executor=self._node.executor, timeout_sec=1.0)
+            temp_executror = self._node.executor
+            temp_executror.remove_node(self._node)
             rclpy.spin_once(self._node, timeout_sec=1.0)
+            temp_executror.add_node(self._node)
             self._node.executor = temp_executror
 
         return self.get_compute_fk_result(future, fk_link_names=fk_link_names)
@@ -1349,9 +1358,11 @@ class MoveIt2:
         # 10ms sleep
         rate = self._node.create_rate(10)
         while not future.done():
-            temp_executror = self._node.executor
             #rclpy.spin_once(self._node,executor=self._node.executor, timeout_sec=1.0)
+            temp_executror = self._node.executor
+            temp_executror.remove_node(self._node)
             rclpy.spin_once(self._node, timeout_sec=1.0)
+            temp_executror.add_node(self._node)
             self._node.executor = temp_executror
 
         return self.get_compute_ik_result(future)
