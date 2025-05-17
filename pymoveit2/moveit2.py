@@ -778,27 +778,31 @@ class MoveIt2:
 
         self._send_goal_async_execute_trajectory(goal=execute_trajectory_goal)
 
-    def wait_until_executed(self) -> bool:
+
+    def wait_until_executed(self, callback=None, timeout_sec=30.0, poll_interval_sec=0.1):
         """
-        Wait until the previously requested motion is finalised through either a success or failure.
+        Non-blocking version of wait_until_executed using ROS2 timers.
+        This method will poll until motion is finished or timeout occurs.
+        When done, it calls the provided callback with True (success) or False (failure).
+
+        Args:
+            callback (function): Function to call with the result (True/False).
+            timeout_sec (float): Max duration to wait for execution.
+            poll_interval_sec (float): Time between polling checks.
         """
+        self._wait_start_time = time.time()
+        self._wait_timeout = timeout_sec
+        self._wait_callback = callback
 
-        # if not self.__is_motion_requested:
-        #     self._node.get_logger().warn(
-        #         "Cannot wait until motion is executed (no motion is in progress)."
-        #     )
-        #     return False
-
-        # self._node.get_logger().info("---> Waiting until motion is executed...")
-        # print("---> Waiting until motion is executed...")
-        # while self.__is_motion_requested or self.__is_executing:
-        #     rclpy.spin_once(self._node, timeout_sec=1.0)
-
-        print ("wait_until_executed (.wait() is called)")
-        print(f"[{threading.current_thread().name}] wait_until_executed (.wait() is called)")
-        #self.__execution_done_event.wait()
-        print(f"[{threading.current_thread().name}] wait_until_executed unblocked")
-        return self.motion_suceeded
+        # Create the polling timer
+        if hasattr(self, "_wait_timer") and self._wait_timer is not None:
+            self._wait_timer.cancel()
+        
+        self._wait_timer = self._node.create_timer(
+            poll_interval_sec,
+            self._check_motion_done,
+            callback_group=self._callback_group
+        )
 
     def reset_controller(
         self,
