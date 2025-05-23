@@ -5,6 +5,7 @@ from typing import Any, List, Optional, Tuple, Union
 from typing import Callable, Optional
 import numpy as np
 import rclpy
+import time
 from action_msgs.msg import GoalStatus
 from geometry_msgs.msg import Point, Pose, PoseStamped, Quaternion
 from moveit_msgs.action import ExecuteTrajectory, MoveGroup
@@ -100,7 +101,7 @@ class MoveIt2:
 
         self._node = node
         self._callback_group = callback_group
-        #self.__execution_done_event = threading.Event()
+        
         # Check for deprecated parameters
         if execute_via_moveit:
             self._node.get_logger().warn(
@@ -442,7 +443,10 @@ class MoveIt2:
                     self.execute(traj)
                 else:
                     self._node.get_logger().warn("Planning failed, no trajectory to execute.")
-                    #self.__execution_done_event.set()
+                    self.motion_suceeded = False
+                    self.__is_executing = False
+                    #time.sleep(10)
+                    
 
             self.plan(
                 position=pose_stamped.pose.position,
@@ -2166,7 +2170,7 @@ class MoveIt2:
         self.__execution_goal_handle = None
         self.__is_executing = False
         print ("execution done is set 2")
-        #self.__execution_done_event.set()
+        
         self.__execution_mutex.release()
 
     def _send_goal_async_execute_trajectory(self,goal: ExecuteTrajectory,):
@@ -2204,6 +2208,10 @@ class MoveIt2:
         self.__execution_mutex.release()
     def is_executing(self):
         return self.__is_executing
+    
+    def set_is_executing(self, value: bool):
+        self.__is_executing = value
+        
     def __response_callback_execute_trajectory(self, response):
         print ("__response_callback_execute_trajectory was called")
         self.__execution_mutex.acquire()
@@ -2229,7 +2237,6 @@ class MoveIt2:
     def __result_callback_execute_trajectory(self, res):
         self.__execution_mutex.acquire()
 
-        print ("__result_callback_execute_trajectory was called2")
         if res.result().status != GoalStatus.STATUS_SUCCEEDED:
             self._node.get_logger().warn(
                 f"Action '{self._execute_trajectory_action_client._action_name}' was unsuccessful: {enum_to_str(GoalStatus, res.result().status)}."
@@ -2237,13 +2244,11 @@ class MoveIt2:
             self.motion_suceeded = False
         else:
             self.motion_suceeded = True
-        print ("__result_callback_execute_trajectory was called2")
         self.__last_error_code = res.result().result.error_code
 
         self.__execution_goal_handle = None
         self.__is_executing = False
-        print ("execution done is set 3")
-        #self.__execution_done_event.set()  # Signal completion
+        
         self.__execution_mutex.release()
 
     @classmethod
