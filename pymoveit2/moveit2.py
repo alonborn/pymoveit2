@@ -354,7 +354,9 @@ class MoveIt2:
         Plan and execute motion based on previously set goals. Optional arguments can be
         passed in to internally use `set_pose_goal()` to define a goal during the call.
         """
-
+        done_event = threading.Event()
+        result_container = {"success": None}
+        
         if isinstance(pose, PoseStamped):
             pose_stamped = pose
         elif isinstance(pose, Pose):
@@ -441,11 +443,19 @@ class MoveIt2:
             def _after_plan_cb(traj):
                 if traj is not None:
                     self.execute(traj)
+
+                    # Wait (polling) until internal state says it's done
+                    while self.is_executing():
+                        time.sleep(0.05)
+                    result_container["success"] = self.motion_suceeded
                 else:
                     self._node.get_logger().warn("Planning failed, no trajectory to execute.")
                     self.motion_suceeded = False
                     self.__is_executing = False
-                    #time.sleep(10)
+                    result_container["success"] = False
+
+                done_event.set()
+
                     
 
             self.plan(
@@ -462,7 +472,8 @@ class MoveIt2:
                 cartesian_fraction_threshold=cartesian_fraction_threshold,
                 callback=_after_plan_cb,
             )
-        
+            done_event.wait()
+            return result_container["success"]
 
     def move_to_configuration(
         self,
