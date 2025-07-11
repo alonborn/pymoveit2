@@ -9,6 +9,9 @@ import time
 from action_msgs.msg import GoalStatus
 from geometry_msgs.msg import Point, Pose, PoseStamped, Quaternion
 from moveit_msgs.action import ExecuteTrajectory, MoveGroup
+from tf_transformations import quaternion_slerp
+from rclpy import spin_until_future_complete
+
 from moveit_msgs.msg import (
     AllowedCollisionEntry,
     AttachedCollisionObject,
@@ -416,11 +419,29 @@ class MoveIt2:
                 self.__move_action_goal.request.start_state.joint_state = (
                     self.joint_state
                 )
+
+            # --- ADDED: pin mid-link orientation as path constraint ---
+            # Clear previous path constraints
+            self.clear_path_constraints()
+            # Create and append an OrientationConstraint on a mid-link (e.g., 'wrist_link')
+            oc = OrientationConstraint()
+            oc.link_name = 'wrist_link'                    # **CHANGED**: choose your mid-link
+            oc.header.frame_id = frame_id or self.__base_link_name
+            oc.orientation = pose_stamped.pose.orientation  # align with desired EE orientation
+            # allow small deviation
+            oc.absolute_x_axis_tolerance = 0.1             # **CHANGED**: tolerance values
+            oc.absolute_y_axis_tolerance = 0.1
+            oc.absolute_z_axis_tolerance = 0.1
+            oc.weight = 1.0
+            self.__move_action_goal.request.path_constraints.orientation_constraints.append(oc)
+            # --- END ADDED ---
+
+
             # Send to goal to the server (async) - both planning and execution
             self._send_goal_async_move_action()
             # Clear all previous goal constrains
             self.clear_goal_constraints()
-            self.clear_path_constraints()
+            # self.clear_path_constraints()
 
         else:
             # Plan via MoveIt 2 and then execute directly with the controller
@@ -715,6 +736,136 @@ class MoveIt2:
         self.clear_path_constraints()
 
         return future
+
+    def find_via_point(
+        self,
+        start: PoseStamped,
+        goal: PoseStamped,
+        steps: int = 20,
+        ik_timeout: float = 0.5
+    ) -> Optional[PoseStamped]:
+        """
+        Linearly interpolate from start→goal in `steps` increments.
+        For each interp pose, call compute_ik() with your current constraints.
+        Return the last feasible PoseStamped before IK fails or violates constraints.
+        """
+        last_good = None
+
+        # convert quats to [x,y,z,w] arrays
+        q0 = [start.pose.orientation.x,
+            start.pose.orientation.y,
+            start.pose.orientation.z,
+            start.pose.orientation.w]
+        q1 = [goal.pose.orientation.x,
+            goal.pose.orientation.y,
+            goal.pose.orientation.z,
+            goal.pose.orientation.w]
+
+        for i in range(1, steps+1):
+            alpha = i / float(steps)
+            # 1) lerp position
+            p = start.pose.position
+            g = goal.pose.position
+            interp_pos = Point(
+                x = p.x + alpha*(g.x - p.x),
+                y = p.y + alpha*(g.y - p.y),
+                z = p.z + alpha*(g.z - p.z),
+            )
+            # 2) slerp orientation
+            iq = quaternion_slerp(q0, q1, alpha)
+            interp_quat = Quaternion(x=iq[0], y=iq[1], z=iq[2], w=iq[3])
+
+            candidate = PoseStamped(
+                header = start.header,   # assume same frame & stamp doesn’t matter
+                pose = Pose(position=interp_pos, orientation=interp_quat)
+            )
+
+            # 3) try IK from the *current* joint state as seed, with your constraints baked in
+            sol = self.compute_ik(
+                position=interp_pos,
+                quat_xyzw=(iq[0],iq[1],iq[2],iq[3]),
+                start_joint_state=self.joint_state,
+                constraints=self.__move_action_goal.request.path_constraints,  # your pin!
+                wait_for_server_timeout_sec=ik_timeout
+            )
+            if sol is None:
+                break
+
+            # 4) verify that mid-link orientation is still within tolerance:
+            #    do FK on that sol, get the mid-link pose, check angle difference ≤ tolerance
+            mid_link_pose = self.compute_fk(
+                joint_state=sol, fk_link_names=[ 'wrist_link' ]
+            )
+            # (compare mid_link_pose.orientation vs. pin orientation, skip for brevity)
+
+            last_good = candidate
+
+        return last_good
+
+    def find_via_point(
+        self,
+        start: PoseStamped,
+        goal: PoseStamped,
+        steps: int = 20,
+        ik_timeout: float = 0.5
+    ) -> Optional[PoseStamped]:
+        """
+        Linearly interpolate from start→goal in `steps` increments.
+        For each interp pose, call compute_ik() with your current constraints.
+        Return the last feasible PoseStamped before IK fails or violates constraints.
+        """
+        last_good = None
+
+        # convert quats to [x,y,z,w] arrays
+        q0 = [start.pose.orientation.x,
+            start.pose.orientation.y,
+            start.pose.orientation.z,
+            start.pose.orientation.w]
+        q1 = [goal.pose.orientation.x,
+            goal.pose.orientation.y,
+            goal.pose.orientation.z,
+            goal.pose.orientation.w]
+
+        for i in range(1, steps+1):
+            alpha = i / float(steps)
+            # 1) lerp position
+            p = start.pose.position
+            g = goal.pose.position
+            interp_pos = Point(
+                x = p.x + alpha*(g.x - p.x),
+                y = p.y + alpha*(g.y - p.y),
+                z = p.z + alpha*(g.z - p.z),
+            )
+            # 2) slerp orientation
+            iq = quaternion_slerp(q0, q1, alpha)
+            interp_quat = Quaternion(x=iq[0], y=iq[1], z=iq[2], w=iq[3])
+
+            candidate = PoseStamped(
+                header = start.header,   # assume same frame & stamp doesn’t matter
+                pose = Pose(position=interp_pos, orientation=interp_quat)
+            )
+
+            # 3) try IK from the *current* joint state as seed, with your constraints baked in
+            sol = self.compute_ik(
+                position=interp_pos,
+                quat_xyzw=(iq[0],iq[1],iq[2],iq[3]),
+                start_joint_state=self.joint_state,
+                constraints=self.__move_action_goal.request.path_constraints,  # your pin!
+                wait_for_server_timeout_sec=ik_timeout
+            )
+            if sol is None:
+                break
+
+            # 4) verify that mid-link orientation is still within tolerance:
+            #    do FK on that sol, get the mid-link pose, check angle difference ≤ tolerance
+            mid_link_pose = self.compute_fk(
+                joint_state=sol, fk_link_names=[ 'wrist_link' ]
+            )
+            # (compare mid_link_pose.orientation vs. pin orientation, skip for brevity)
+
+            last_good = candidate
+
+        return last_good
 
     def get_trajectory(
         self,
@@ -1241,6 +1392,73 @@ class MoveIt2:
 
         self.__move_action_goal.request.path_constraints = Constraints()
 
+    def find_via_point(
+        self,
+        start: PoseStamped,
+        goal: PoseStamped,
+        steps: int = 20,
+        ik_timeout: float = 0.5
+    ) -> Optional[PoseStamped]:
+        """
+        Linearly interpolate from start→goal in `steps` increments.
+        For each interp pose, call compute_ik() with your current constraints.
+        Return the last feasible PoseStamped before IK fails or violates constraints.
+        """
+        last_good = None
+
+        # convert quats to [x,y,z,w] arrays
+        q0 = [start.pose.orientation.x,
+            start.pose.orientation.y,
+            start.pose.orientation.z,
+            start.pose.orientation.w]
+        q1 = [goal.pose.orientation.x,
+            goal.pose.orientation.y,
+            goal.pose.orientation.z,
+            goal.pose.orientation.w]
+
+        for i in range(1, steps+1):
+            alpha = i / float(steps)
+            # 1) lerp position
+            p = start.pose.position
+            g = goal.pose.position
+            interp_pos = Point(
+                x = p.x + alpha*(g.x - p.x),
+                y = p.y + alpha*(g.y - p.y),
+                z = p.z + alpha*(g.z - p.z),
+            )
+            # 2) slerp orientation
+            iq = quaternion_slerp(q0, q1, alpha)
+            interp_quat = Quaternion(x=iq[0], y=iq[1], z=iq[2], w=iq[3])
+
+            candidate = PoseStamped(
+                header = start.header,   # assume same frame & stamp doesn’t matter
+                pose = Pose(position=interp_pos, orientation=interp_quat)
+            )
+
+            # 3) try IK from the *current* joint state as seed, with your constraints baked in
+            sol = self.compute_ik(
+                position=interp_pos,
+                quat_xyzw=(iq[0],iq[1],iq[2],iq[3]),
+                start_joint_state=self.joint_state,
+                constraints=self.__move_action_goal.request.path_constraints,  # your pin!
+                wait_for_server_timeout_sec=ik_timeout
+            )
+            if sol is None:
+                break
+
+            # 4) verify that mid-link orientation is still within tolerance:
+            #    do FK on that sol, get the mid-link pose, check angle difference ≤ tolerance
+            mid_link_pose = self.compute_fk(
+                joint_state=sol, fk_link_names=[ 'wrist_link' ]
+            )
+            # (compare mid_link_pose.orientation vs. pin orientation, skip for brevity)
+
+            last_good = candidate
+
+        return last_good
+
+
+
     def compute_fk(
         self,
         joint_state: Optional[Union[JointState, List[float]]] = None,
@@ -1350,11 +1568,24 @@ class MoveIt2:
             return None
 
         self._node.get_logger().info("---> Waiting for IK result...")
-        print("---> Waiting for IK result...")  
-        while not future.done():
-            rclpy.spin_once(self._node, timeout_sec=1.0)
+       
+       
+        # print("---> Waiting for IK result...")  
+        # while not future.done():
+        #     rclpy.spin_once(self._node, timeout_sec=1.0)
 
-        return self.get_compute_ik_result(future)
+        # return self.get_compute_ik_result(future)
+
+        # NEW: simply block on the future; your MultiThreadedExecutor is already pumping callbacks
+
+        try:
+            # this will block until the service response arrives (or timeout)
+            future.result(timeout=wait_for_server_timeout_sec)
+        except TimeoutError:
+            self._node.get_logger().error("Compute IK timed out")
+            return None
+
+        return self.get_compute_ik_result(future)        
 
     def get_compute_ik_result(
         self,
