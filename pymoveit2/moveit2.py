@@ -742,131 +742,125 @@ class MoveIt2:
         start: PoseStamped,
         goal: PoseStamped,
         steps: int = 20,
-        ik_timeout: float = 0.5
-    ) -> Optional[PoseStamped]:
-        """
-        Linearly interpolate from start→goal in `steps` increments.
-        For each interp pose, call compute_ik() with your current constraints.
-        Return the last feasible PoseStamped before IK fails or violates constraints.
-        """
-        last_good = None
+        ik_timeout: float = 0.5,
+        callback = None
+    ) -> None:
+        self._via_start = start
+        self._via_goal = goal
+        self._via_steps = steps
+        self._via_index = 1  # start from 1 (not 0)
+        self._via_ik_timeout = ik_timeout
+        self._via_last_good = None
+        self._via_callback = callback
 
-        # convert quats to [x,y,z,w] arrays
-        q0 = [start.pose.orientation.x,
+        self._schedule_next_candidate() 
+
+        if callback is None:
+            raise ValueError("Callback must be provided for find_via_point")
+
+
+    def on_ik_solved(self, future):
+        try:
+            res = future.result()
+        except Exception as e:
+            self._node.get_logger().error(f"IK failed: {e}")
+            return self._via_callback(self._via_last_good)
+
+        if res.error_code.val != MoveItErrorCodes.SUCCESS:
+            return self._via_callback(self._via_last_good)
+        self._node.get_logger().debug(
+            f"IK solved for via-point {self._via_index}/{self._via_steps}"
+        )
+        # Check orientation constraint here if needed...
+        # You can also do FK from mid-link and validate.
+
+        # If all is good:
+
+        self._node.get_logger().debug(f"Via-point {self._via_index}/{self._via_steps} pose: {self._via_current_candidate}")
+        self._via_last_good = self._via_current_candidate
+        self._via_index += 1
+        self._schedule_next_candidate()
+
+
+    @staticmethod
+    def interpolate_pose(start: PoseStamped, goal: PoseStamped, t: float) -> PoseStamped:
+        """Interpolates between start and goal PoseStamped by fraction t ∈ [0, 1]."""
+        assert 0.0 <= t <= 1.0, "t must be between 0 and 1"
+
+        interp = PoseStamped()
+        interp.header.frame_id = start.header.frame_id
+        interp.header.stamp = goal.header.stamp  # Or rclpy.clock.Clock().now().to_msg()
+
+        # --- Interpolate position ---
+        interp.pose.position.x = (1 - t) * start.pose.position.x + t * goal.pose.position.x
+        interp.pose.position.y = (1 - t) * start.pose.position.y + t * goal.pose.position.y
+        interp.pose.position.z = (1 - t) * start.pose.position.z + t * goal.pose.position.z
+
+        # --- Interpolate orientation using slerp ---
+        q0 = [
+            start.pose.orientation.x,
             start.pose.orientation.y,
             start.pose.orientation.z,
-            start.pose.orientation.w]
-        q1 = [goal.pose.orientation.x,
+            start.pose.orientation.w,
+        ]
+        q1 = [
+            goal.pose.orientation.x,
             goal.pose.orientation.y,
             goal.pose.orientation.z,
-            goal.pose.orientation.w]
+            goal.pose.orientation.w,
+        ]
+        q_interp = quaternion_slerp(q0, q1, t)
 
-        for i in range(1, steps+1):
-            alpha = i / float(steps)
-            # 1) lerp position
-            p = start.pose.position
-            g = goal.pose.position
-            interp_pos = Point(
-                x = p.x + alpha*(g.x - p.x),
-                y = p.y + alpha*(g.y - p.y),
-                z = p.z + alpha*(g.z - p.z),
-            )
-            # 2) slerp orientation
-            iq = quaternion_slerp(q0, q1, alpha)
-            interp_quat = Quaternion(x=iq[0], y=iq[1], z=iq[2], w=iq[3])
+        interp.pose.orientation = Quaternion(
+            x=q_interp[0], y=q_interp[1], z=q_interp[2], w=q_interp[3]
+        )
 
-            candidate = PoseStamped(
-                header = start.header,   # assume same frame & stamp doesn’t matter
-                pose = Pose(position=interp_pos, orientation=interp_quat)
-            )
+        return interp
 
-            # 3) try IK from the *current* joint state as seed, with your constraints baked in
-            sol = self.compute_ik(
-                position=interp_pos,
-                quat_xyzw=(iq[0],iq[1],iq[2],iq[3]),
-                start_joint_state=self.joint_state,
-                constraints=self.__move_action_goal.request.path_constraints,  # your pin!
-                wait_for_server_timeout_sec=ik_timeout
-            )
-            if sol is None:
-                break
 
-            # 4) verify that mid-link orientation is still within tolerance:
-            #    do FK on that sol, get the mid-link pose, check angle difference ≤ tolerance
-            mid_link_pose = self.compute_fk(
-                joint_state=sol, fk_link_names=[ 'wrist_link' ]
-            )
-            # (compare mid_link_pose.orientation vs. pin orientation, skip for brevity)
+    def _schedule_next_candidate(self):
+        # 1. Done searching — return last good pose via callback
+        if self._via_index >= self._via_steps or self._via_index <= 0:
+            self._node.get_logger().info("Via-point search completed. Returning last good via-point.")
+            self._via_callback(self._via_last_good)
+            return
 
-            last_good = candidate
+        # 2. Defensive: make sure joint state is available
+        if self.joint_state is None:
+            self._node.get_logger().warn("Cannot compute IK: joint state is not available.")
+            self._via_callback(None)
+            return
 
-        return last_good
+        # 3. Compute interpolation factor t = [0.0, 1.0]
+        t = float(self._via_index) / float(self._via_steps)
 
-    def find_via_point(
-        self,
-        start: PoseStamped,
-        goal: PoseStamped,
-        steps: int = 20,
-        ik_timeout: float = 0.5
-    ) -> Optional[PoseStamped]:
-        """
-        Linearly interpolate from start→goal in `steps` increments.
-        For each interp pose, call compute_ik() with your current constraints.
-        Return the last feasible PoseStamped before IK fails or violates constraints.
-        """
-        last_good = None
+        # 4. Interpolate start→goal at fraction t
+        interp_pose = self.interpolate_pose(self._via_start[0], self._via_goal, t)
+        self._via_current_candidate = interp_pose
 
-        # convert quats to [x,y,z,w] arrays
-        q0 = [start.pose.orientation.x,
-            start.pose.orientation.y,
-            start.pose.orientation.z,
-            start.pose.orientation.w]
-        q1 = [goal.pose.orientation.x,
-            goal.pose.orientation.y,
-            goal.pose.orientation.z,
-            goal.pose.orientation.w]
+        # 5. Log current step
+        self._node.get_logger().debug(f"Trying via-point step {self._via_index}/{self._via_steps} at t={t:.2f}")
 
-        for i in range(1, steps+1):
-            alpha = i / float(steps)
-            # 1) lerp position
-            p = start.pose.position
-            g = goal.pose.position
-            interp_pos = Point(
-                x = p.x + alpha*(g.x - p.x),
-                y = p.y + alpha*(g.y - p.y),
-                z = p.z + alpha*(g.z - p.z),
-            )
-            # 2) slerp orientation
-            iq = quaternion_slerp(q0, q1, alpha)
-            interp_quat = Quaternion(x=iq[0], y=iq[1], z=iq[2], w=iq[3])
+        # 6. Create async IK request
+        future = self.compute_ik_async(
+            position=interp_pose.pose.position,
+            quat_xyzw=(
+                interp_pose.pose.orientation.x,
+                interp_pose.pose.orientation.y,
+                interp_pose.pose.orientation.z,
+                interp_pose.pose.orientation.w,
+            ),
+            start_joint_state=self.joint_state,
+            constraints=self.__move_action_goal.request.path_constraints
+                if hasattr(self, "__move_action_goal") else None,
+            wait_for_server_timeout_sec=self._via_ik_timeout,
+        )
 
-            candidate = PoseStamped(
-                header = start.header,   # assume same frame & stamp doesn’t matter
-                pose = Pose(position=interp_pos, orientation=interp_quat)
-            )
+        # 7. Register callback for when IK completes
+        future.add_done_callback(self.on_ik_solved)
 
-            # 3) try IK from the *current* joint state as seed, with your constraints baked in
-            sol = self.compute_ik(
-                position=interp_pos,
-                quat_xyzw=(iq[0],iq[1],iq[2],iq[3]),
-                start_joint_state=self.joint_state,
-                constraints=self.__move_action_goal.request.path_constraints,  # your pin!
-                wait_for_server_timeout_sec=ik_timeout
-            )
-            if sol is None:
-                break
 
-            # 4) verify that mid-link orientation is still within tolerance:
-            #    do FK on that sol, get the mid-link pose, check angle difference ≤ tolerance
-            mid_link_pose = self.compute_fk(
-                joint_state=sol, fk_link_names=[ 'wrist_link' ]
-            )
-            # (compare mid_link_pose.orientation vs. pin orientation, skip for brevity)
-
-            last_good = candidate
-
-        return last_good
-
+    
     def get_trajectory(
         self,
         future: Future,
@@ -1392,71 +1386,31 @@ class MoveIt2:
 
         self.__move_action_goal.request.path_constraints = Constraints()
 
-    def find_via_point(
-        self,
-        start: PoseStamped,
-        goal: PoseStamped,
-        steps: int = 20,
-        ik_timeout: float = 0.5
-    ) -> Optional[PoseStamped]:
-        """
-        Linearly interpolate from start→goal in `steps` increments.
-        For each interp pose, call compute_ik() with your current constraints.
-        Return the last feasible PoseStamped before IK fails or violates constraints.
-        """
-        last_good = None
+    # def compute_fk(
+    #     self,
+    #     joint_state: Optional[Union[JointState, List[float]]] = None,
+    #     fk_link_names: Optional[List[str]] = None,
+    # ) -> Optional[Union[PoseStamped, List[PoseStamped]]]:
+    #     """
+    #     Call compute_fk_async and wait on future
+    #     """
+    #     # future = self.compute_fk_async(
+    #     #     **{key: value for key, value in locals().items() if key != "self"}
+    #     # )
 
-        # convert quats to [x,y,z,w] arrays
-        q0 = [start.pose.orientation.x,
-            start.pose.orientation.y,
-            start.pose.orientation.z,
-            start.pose.orientation.w]
-        q1 = [goal.pose.orientation.x,
-            goal.pose.orientation.y,
-            goal.pose.orientation.z,
-            goal.pose.orientation.w]
+    #     future = self.compute_fk_async(
+    #         joint_state=joint_state,
+    #         fk_link_names=fk_link_names,
+    #     )
 
-        for i in range(1, steps+1):
-            alpha = i / float(steps)
-            # 1) lerp position
-            p = start.pose.position
-            g = goal.pose.position
-            interp_pos = Point(
-                x = p.x + alpha*(g.x - p.x),
-                y = p.y + alpha*(g.y - p.y),
-                z = p.z + alpha*(g.z - p.z),
-            )
-            # 2) slerp orientation
-            iq = quaternion_slerp(q0, q1, alpha)
-            interp_quat = Quaternion(x=iq[0], y=iq[1], z=iq[2], w=iq[3])
+    #     if future is None:
+    #         return None
+    #     self._node.get_logger().info("---> Waiting for FK result...")
+    #     print("---> Waiting for FK result...")
+    #     while not future.done():
+    #         rclpy.spin_once(self._node, timeout_sec=1.0)
 
-            candidate = PoseStamped(
-                header = start.header,   # assume same frame & stamp doesn’t matter
-                pose = Pose(position=interp_pos, orientation=interp_quat)
-            )
-
-            # 3) try IK from the *current* joint state as seed, with your constraints baked in
-            sol = self.compute_ik(
-                position=interp_pos,
-                quat_xyzw=(iq[0],iq[1],iq[2],iq[3]),
-                start_joint_state=self.joint_state,
-                constraints=self.__move_action_goal.request.path_constraints,  # your pin!
-                wait_for_server_timeout_sec=ik_timeout
-            )
-            if sol is None:
-                break
-
-            # 4) verify that mid-link orientation is still within tolerance:
-            #    do FK on that sol, get the mid-link pose, check angle difference ≤ tolerance
-            mid_link_pose = self.compute_fk(
-                joint_state=sol, fk_link_names=[ 'wrist_link' ]
-            )
-            # (compare mid_link_pose.orientation vs. pin orientation, skip for brevity)
-
-            last_good = candidate
-
-        return last_good
-
+    #     return self.get_compute_fk_result(future, fk_link_names=fk_link_names)
 
 
     def compute_fk(
@@ -1465,20 +1419,30 @@ class MoveIt2:
         fk_link_names: Optional[List[str]] = None,
     ) -> Optional[Union[PoseStamped, List[PoseStamped]]]:
         """
-        Call compute_fk_async and wait on future
+        Call compute_fk_async and block until future completes using threading.Event.
+        Avoids spin_once.
         """
         future = self.compute_fk_async(
-            **{key: value for key, value in locals().items() if key != "self"}
+            joint_state=joint_state,
+            fk_link_names=fk_link_names,
         )
 
         if future is None:
             return None
+
         self._node.get_logger().info("---> Waiting for FK result...")
-        print("---> Waiting for FK result...")
-        while not future.done():
-            rclpy.spin_once(self._node, timeout_sec=1.0)
+
+        done_event = threading.Event()
+
+        def _done_callback(fut):
+            done_event.set()
+
+        future.add_done_callback(_done_callback)
+
+        done_event.wait()  # Block until callback is invoked
 
         return self.get_compute_fk_result(future, fk_link_names=fk_link_names)
+
 
     def get_compute_fk_result(
         self,
@@ -1560,9 +1524,18 @@ class MoveIt2:
         """
         Call compute_ik_async and wait on future
         """
+        # future = self.compute_ik_async(
+        #     **{key: value for key, value in locals().items() if key != "self"}
+        # )
+
         future = self.compute_ik_async(
-            **{key: value for key, value in locals().items() if key != "self"}
+            position=position,
+            quat_xyzw=quat_xyzw,
+            start_joint_state=start_joint_state,
+            constraints=constraints,
+            wait_for_server_timeout_sec=wait_for_server_timeout_sec
         )
+
 
         if future is None:
             return None
