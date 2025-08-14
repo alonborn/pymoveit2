@@ -336,7 +336,7 @@ class MoveIt2:
         timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         full_message = f"[{timestamp}] {message}"
         if level == 'info':
-            self.get_logger().info(full_message)
+            self._node.get_logger().info(full_message)
         elif level == 'error':
             self.get_logger().error(full_message)
         elif level == 'warn':
