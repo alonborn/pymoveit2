@@ -106,6 +106,7 @@ class MoveIt2:
 
         self._node = node
         self._callback_group = callback_group
+        self.last_joint_state = None
         
         # Check for deprecated parameters
         if execute_via_moveit:
@@ -734,6 +735,10 @@ class MoveIt2:
                 tolerance=tolerance_joint_position,
                 weight=weight_joint_position,
             )
+
+
+        start_joint_state = self.last_joint_state
+        
         # Define starting state for the plan (default to the current state)
         while start_joint_state is None:
             self._node._logger.warn(message="Joint states are not available yet!")
@@ -744,7 +749,8 @@ class MoveIt2:
                 self._node._logger.warn(message="---> Waiting for joint states...")  
                 print ("---> Waiting for joint states...")
                 rclpy.spin_once(self._node, timeout_sec=1.0)
-        self._node._logger.info(message="Joint states are available now")
+        # self.log_with_time("info","Joint states are available now")
+        print("Joint states are available now")
 
         # Plan trajectory asynchronously by service call
         if cartesian:
@@ -2479,21 +2485,28 @@ class MoveIt2:
         self.__execution_mutex.release()
 
     def __result_callback_execute_trajectory(self, res):
+        # self.log_with_time('info', f"[RESULT_CB_START] Called at {time.time():.3f}")
+        print(f"[RESULT_CB_START] Called at {time.time():.3f}")
         self.__execution_mutex.acquire()
 
+        # This is where the motion result arrives from the controller
+        # self.log_with_time('info', f"[RESULT_CB] Status={res.result().status}, error_code={res.result().result.error_code}")
+        print(f"[RESULT_CB] Status={res.result().status}, error_code={res.result().result.error_code}")
+
         if res.result().status != GoalStatus.STATUS_SUCCEEDED:
-            self.log_with_time('warn' ,
-                f"Action '{self._execute_trajectory_action_client._action_name}' was unsuccessful: {enum_to_str(GoalStatus, res.result().status)}."
-            )
             self.motion_suceeded = False
         else:
             self.motion_suceeded = True
+
         self.__last_error_code = res.result().result.error_code
 
         self.__execution_goal_handle = None
         self.__is_executing = False
-        
+
         self.__execution_mutex.release()
+        # self.log_with_time('info', f"[RESULT_CB_END] Released mutex at {time.time():.3f}")
+        print( f"[RESULT_CB_END] Released mutex at {time.time():.3f}")
+
 
     @classmethod
     def __init_move_action_goal(
