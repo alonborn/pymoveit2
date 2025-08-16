@@ -339,11 +339,11 @@ class MoveIt2:
         if level == 'info':
             self._node.get_logger().info(full_message)
         elif level == 'error':
-            self.get_logger().error(full_message)
+            self._node.get_logger().error(full_message)
         elif level == 'warn':
-            self.get_logger().warn(full_message)
+            self._node.get_logger().warn(full_message)
         else:
-            self.get_logger().debug(full_message)
+            self._node.get_logger().debug(full_message)
 
     def cancel_execution(self):
         if self.query_state() != MoveIt2State.EXECUTING:
