@@ -1,4 +1,5 @@
 import copy
+import math
 import threading
 from enum import Enum
 from typing import Any, List, Optional, Tuple, Union
@@ -12,7 +13,8 @@ from moveit_msgs.action import ExecuteTrajectory, MoveGroup
 from tf_transformations import quaternion_slerp
 from rclpy import spin_until_future_complete
 import datetime
-
+from moveit_msgs.msg import JointConstraint
+import numpy as np
 
 from moveit_msgs.msg import (
     AllowedCollisionEntry,
@@ -364,7 +366,41 @@ class MoveIt2:
     def get_last_execution_error_code(self) -> Optional[MoveItErrorCodes]:
         return self.__last_error_code
 
-    ####
+    def _apply_j6_stability_constraint(self):
+        self.log_with_time('info' ,"Applying J6 stability constraint.")
+        print("Applying J6 stability constraint.")
+        """
+        Applies a JointConstraint on joint_6 to prevent 360° flips by keeping it
+        close to its current value. Should be called right before planning.
+        """
+        if self.joint_state is None:
+            return None
+        self.log_with_time('info' ,"Applying J6 stability constraint.")
+        print("Applying J6 stability constraint2.")
+        # Extract current J6 value
+        current_j6 = None
+        for i, name in enumerate(self.joint_state.name):
+            if name == "joint_6":
+                current_j6 = self.joint_state.position[i]
+                break
+
+        if current_j6 is None:
+            return None
+
+        # Build the constraint
+        c = Constraints()
+        jc = JointConstraint()
+        jc.joint_name = "joint_6"
+        jc.position = current_j6
+        jc.tolerance_above = math.radians(20)  # tune if needed
+        jc.tolerance_below = math.radians(20)
+        jc.weight = 1.0
+
+        c.joint_constraints.append(jc)
+        return c
+
+
+
 
     def move_to_pose(
         self,
@@ -453,6 +489,9 @@ class MoveIt2:
             # --- ADDED: pin mid-link orientation as path constraint ---
             # Clear previous path constraints
             self.clear_path_constraints()
+
+
+
             # Create and append an OrientationConstraint on a mid-link (e.g., 'wrist_link')
             oc = OrientationConstraint()
             oc.link_name = 'wrist_link'                    # **CHANGED**: choose your mid-link
@@ -507,7 +546,9 @@ class MoveIt2:
 
                 done_event.set()
 
-                    
+            # jc = self._apply_j6_stability_constraint()
+            # if jc is not None:
+            #     self.__move_action_goal.request.path_constraints = jc    
 
             self.plan(
                 position=pose_stamped.pose.position,
@@ -567,6 +608,7 @@ class MoveIt2:
 
         else:
             # Plan via MoveIt 2 and then execute directly with the controller
+            
             self.execute(
                 self.plan(
                     joint_positions=joint_positions,
@@ -2529,8 +2571,8 @@ class MoveIt2:
         move_action_goal.request.pipeline_id = ""
         move_action_goal.request.planner_id = ""
         move_action_goal.request.group_name = group_name
-        move_action_goal.request.num_planning_attempts = 5
-        move_action_goal.request.allowed_planning_time = 0.5
+        move_action_goal.request.num_planning_attempts = 30  # CHANGED!!!
+        move_action_goal.request.allowed_planning_time = 10.0  # CHANGED!!!
         move_action_goal.request.max_velocity_scaling_factor = 0.0
         move_action_goal.request.max_acceleration_scaling_factor = 0.0
         # Note: Attribute was renamed in Iron (https://github.com/ros-planning/moveit_msgs/pull/130)
